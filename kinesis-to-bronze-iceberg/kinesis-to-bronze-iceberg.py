@@ -1,23 +1,29 @@
 import sys
+from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
+from pyspark.sql.functions import col, get_json_object
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 
+# استلام متغيرات الوظيفة
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
+
+# 1. إعدادات Iceberg (Static Configs) - يجب تعريفها قبل تشغيل SparkContext
+conf = SparkConf()
+conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+
+# 2. تهيئة الـ Sessions
+sc = SparkContext(conf=conf)
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# 1. إعداد الـ Spark Session لدعم Iceberg
-spark.conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
-spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
-spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-
-# 2. قراءة البيانات المتدفقة من Kinesis
+# 3. قراءة البيانات المتدفقة من Kinesis
 kinesis_df = spark.readStream \
     .format("kinesis") \
     .option("streamName", "crm-cdc-stream") \
@@ -25,21 +31,26 @@ kinesis_df = spark.readStream \
     .option("startingPosition", "TRIM_HORIZON") \
     .load()
 
-# 3. تحويل الـ Payload من Binary إلى String (JSON)
-# سنحتفظ بكل بيانات الرسالة في عمود واحد كـ Raw Data لحفظها في الـ Bronze
+# 4. تحويل الـ Payload واستخراج الميتاداتا الهامة للـ Partitioning والتحليل اللاحق
 bronze_df = kinesis_df.selectExpr(
     "CAST(data AS STRING) as raw_payload",
-    "approximateArrivalTimestamp as arrival_time",
-    "partitionKey as kinesis_partition_key"
+    "approximateArrivalTimestamp as arrival_time"
+).withColumn(
+    "source_table", get_json_object(col("raw_payload"), "$.metadata.table-name")
+).withColumn(
+    "record_type", get_json_object(col("raw_payload"), "$.metadata.record-type")
+).withColumn(
+    "operation", get_json_object(col("raw_payload"), "$.metadata.operation")
 )
 
-# 4. تحديد مسار الـ Checkpoint في S3 (لتتبع تقدم القراءة)
+# 5. مسار الـ Checkpoint لتتبع تقدم القراءة (تأكد من تعديل اسم الـ Bucket)
 checkpoint_path = "s3://crm-datalake-raw/bronze-layer/"
 
-# 5. الكتابة المستمرة (Streaming) في جدول Iceberg في طبقة الـ Bronze
+# 6. الكتابة المستمرة في جدول Iceberg مع التقسيم (Partitioning) بناءً على اسم الجدول
 query = bronze_df.writeStream \
     .format("iceberg") \
     .outputMode("append") \
+    .partitionBy("source_table") \
     .option("checkpointLocation", checkpoint_path) \
     .toTable("glue_catalog.crm_bronze_db.raw_events")
 

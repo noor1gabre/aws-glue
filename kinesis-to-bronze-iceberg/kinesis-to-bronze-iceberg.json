@@ -12,18 +12,17 @@
     "pythonVersion" : "3"
   },
   "defaultArguments" : {
-    "--enable-glue-datacatalog" : "",
-    "--job-bookmark-option" : "job-bookmark-disable",
-    "--datalake-formats" : "iceberg",
-    "--TempDir" : "s3://aws-glue-assets-064164578894-eu-north-1/temporary/",
     "--enable-metrics" : "",
-    "--enable-spark-ui" : "true",
     "--spark-event-logs-path" : "s3://aws-glue-assets-064164578894-eu-north-1/sparkHistoryLogs/",
     "--enable-job-insights" : "true",
     "--enable-observability-metrics" : "false",
     "--conf" : "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+    "--enable-glue-datacatalog" : "",
     "--enable-continuous-cloudwatch-log" : "true",
+    "--job-bookmark-option" : "job-bookmark-disable",
+    "--datalake-formats" : "iceberg",
     "--job-language" : "python",
+    "--TempDir" : "s3://aws-glue-assets-064164578894-eu-north-1/temporary/",
     "--enable-auto-scaling" : "true"
   },
   "maxRetries" : 0,
