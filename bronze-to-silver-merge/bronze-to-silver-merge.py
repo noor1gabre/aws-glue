@@ -92,39 +92,32 @@ def get_watermark(silver_table):
     Read the stored watermark from the Iceberg table's properties.
     Returns None if the property has never been set (first run).
 
-    IMPORTANT: SHOW TBLPROPERTIES table ('key') does NOT return an empty
-    result when the key is missing - it returns exactly one row whose
-    single column contains the literal text:
+    IMPORTANT: SHOW TBLPROPERTIES table ('key') always returns exactly
+    one row shaped (key, value). When the property does NOT exist, the
+    'value' column (row[0][1]) contains the literal text:
         "Table <name> does not have property: <key>"
-    That text must be detected explicitly, otherwise it gets treated as
-    a real (bogus) watermark value and silently breaks all filtering.
+    while the 'key' column (row[0][0]) still just echoes back the key
+    name we asked for. The error text must be checked in the VALUE
+    column, not the key column - checking the wrong column silently
+    breaks all downstream filtering (this was our earlier bug).
     """
     try:
         props_df = spark.sql(f"SHOW TBLPROPERTIES {silver_table} ('{WATERMARK_KEY}')")
         row = props_df.collect()
         logger.debug("[%s] raw SHOW TBLPROPERTIES result: %s", silver_table, row)
+
         if not row:
             logger.info("[%s] SHOW TBLPROPERTIES returned no rows - treating as first run.", silver_table)
             return None
 
-        raw_value = row[0][0]
+        value = row[0][1] if len(row[0]) > 1 else row[0][0]
 
-        if "does not have property" in raw_value or "not set" in raw_value:
+        if value is None or "does not have property" in value or "not set" in value:
             logger.info("[%s] no watermark set yet - this is the first run.", silver_table)
             return None
 
-        # When the property DOES exist, Spark returns it as "key\tvalue"
-        # in that single column (or sometimes as two columns depending on
-        # engine version) - handle both shapes defensively.
-        if len(row[0]) > 1 and row[0][1] is not None:
-            watermark = row[0][1]
-        elif "\t" in raw_value:
-            watermark = raw_value.split("\t", 1)[1]
-        else:
-            watermark = raw_value
-
-        logger.info("[%s] found existing watermark: %s", silver_table, watermark)
-        return watermark
+        logger.info("[%s] found existing watermark: %s", silver_table, value)
+        return value
 
     except Exception:
         logger.warning(
