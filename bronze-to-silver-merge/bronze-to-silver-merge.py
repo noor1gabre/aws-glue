@@ -18,7 +18,7 @@ from awsglue.utils import getResolvedOptions
 #   2026-08-19 10:02:14 | INFO | silver_merge | [bronze_deals] watermark = ...
 # which you can filter by level in CloudWatch Logs Insights.
 logger = logging.getLogger("silver_merge")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # TEMP: set back to INFO once the watermark fix is verified
 
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter(
@@ -38,7 +38,13 @@ conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSpa
 conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
 conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
 conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-conf.set("spark.sql.catalog.glue_catalog.warehouse", "s3://crm-datalake-raw/")
+# NOTE: no warehouse path is set here on purpose. Bronze tables live under
+# s3://crm-datalake-raw/bronze-layer/ and Silver tables live under
+# s3://crm-datalake-silver/silver-layer/ - two different buckets. Since
+# both were already created explicitly (see create_silver_tables.py and
+# reset_bronze_tables.py), Spark reads each table's real location from
+# the Glue Catalog metadata directly and never needs to fall back to a
+# default warehouse path here.
 
 sc = SparkContext(conf=conf)
 glueContext = GlueContext(sc)
@@ -82,21 +88,50 @@ WATERMARK_KEY = "silver_merge.last_arrival_time"
 
 
 def get_watermark(silver_table):
-    """Read the stored watermark from the Iceberg table's properties. None if never run."""
+    """
+    Read the stored watermark from the Iceberg table's properties.
+    Returns None if the property has never been set (first run).
+
+    IMPORTANT: SHOW TBLPROPERTIES table ('key') does NOT return an empty
+    result when the key is missing - it returns exactly one row whose
+    single column contains the literal text:
+        "Table <name> does not have property: <key>"
+    That text must be detected explicitly, otherwise it gets treated as
+    a real (bogus) watermark value and silently breaks all filtering.
+    """
     try:
         props_df = spark.sql(f"SHOW TBLPROPERTIES {silver_table} ('{WATERMARK_KEY}')")
         row = props_df.collect()
-        if row and "not set" not in row[0][0]:
-            watermark = row[0][1] if len(row[0]) > 1 else row[0][0]
-            logger.debug("[%s] found existing watermark: %s", silver_table, watermark)
-            return watermark
+        logger.debug("[%s] raw SHOW TBLPROPERTIES result: %s", silver_table, row)
+        if not row:
+            logger.info("[%s] SHOW TBLPROPERTIES returned no rows - treating as first run.", silver_table)
+            return None
+
+        raw_value = row[0][0]
+
+        if "does not have property" in raw_value or "not set" in raw_value:
+            logger.info("[%s] no watermark set yet - this is the first run.", silver_table)
+            return None
+
+        # When the property DOES exist, Spark returns it as "key\tvalue"
+        # in that single column (or sometimes as two columns depending on
+        # engine version) - handle both shapes defensively.
+        if len(row[0]) > 1 and row[0][1] is not None:
+            watermark = row[0][1]
+        elif "\t" in raw_value:
+            watermark = raw_value.split("\t", 1)[1]
+        else:
+            watermark = raw_value
+
+        logger.info("[%s] found existing watermark: %s", silver_table, watermark)
+        return watermark
+
     except Exception:
         logger.warning(
-            "[%s] could not read watermark property, treating as first run.",
+            "[%s] could not read watermark property (exception thrown), treating as first run.",
             silver_table, exc_info=True,
         )
-    logger.info("[%s] no watermark found - this looks like the first run.", silver_table)
-    return None
+        return None
 
 
 def set_watermark(silver_table, value):
