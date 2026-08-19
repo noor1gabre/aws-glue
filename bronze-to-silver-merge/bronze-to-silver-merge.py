@@ -1,6 +1,7 @@
 import sys
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
 from pyspark.sql import Window
@@ -10,41 +11,41 @@ from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 
 # ---------------------------------------------------------------------
-# Logging setup
+# Logging Setup
 # ---------------------------------------------------------------------
-# Glue jobs already stream stdout/stderr to CloudWatch, but plain print()
-# gives you no level, timestamp, or module context - hard to filter or
-# alarm on. Using the logging module gives structured lines like:
-#   2026-08-19 10:02:14 | INFO | silver_merge | [bronze_deals] watermark = ...
-# which you can filter by level in CloudWatch Logs Insights.
 logger = logging.getLogger("silver_merge")
-logger.setLevel(logging.DEBUG)  # TEMP: set back to INFO once the watermark fix is verified
+logger.setLevel(logging.INFO)
 
 handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter(
-    fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+formatter = logging.Formatter(fmt="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-logger.propagate = False  # avoid duplicate lines via the root logger
+logger.propagate = False
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+# ---------------------------------------------------------------------
+# Argument Parsing (Handling Lambda Triggers & Manual Runs)
+# ---------------------------------------------------------------------
+args_keys = ['JOB_NAME']
+# Safely check if Lambda passed the specific tables to process
+if '--tables_to_process' in sys.argv:
+    args_keys.append('tables_to_process')
+args = getResolvedOptions(sys.argv, args_keys)
+
+# Parse the target tables. If empty (e.g., manual run), it falls back to an empty list.
+tables_to_process_str = args.get('tables_to_process', '')
+tables_to_process = tables_to_process_str.split(',') if tables_to_process_str else []
 
 logger.info("Job starting: %s", args['JOB_NAME'])
+logger.info("Tables triggered by Lambda: %s", tables_to_process)
 
+# ---------------------------------------------------------------------
+# Spark & Iceberg Configuration
+# ---------------------------------------------------------------------
 conf = SparkConf()
 conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
 conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
 conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
 conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-# NOTE: no warehouse path is set here on purpose. Bronze tables live under
-# s3://crm-datalake-raw/bronze-layer/ and Silver tables live under
-# s3://crm-datalake-silver/silver-layer/ - two different buckets. Since
-# both were already created explicitly (see create_silver_tables.py and
-# reset_bronze_tables.py), Spark reads each table's real location from
-# the Glue Catalog metadata directly and never needs to fall back to a
-# default warehouse path here.
 
 sc = SparkContext(conf=conf)
 glueContext = GlueContext(sc)
@@ -52,10 +53,8 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-logger.info("Spark session and Glue job initialized.")
-
 # ---------------------------------------------------------------------
-# Config: one entry per CRM table, describing how to merge Bronze->Silver
+# Merge Configurations
 # ---------------------------------------------------------------------
 MERGE_CONFIG = [
     {
@@ -86,81 +85,60 @@ MERGE_CONFIG = [
 
 WATERMARK_KEY = "silver_merge.last_arrival_time"
 
-
+# ---------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------
 def get_watermark(silver_table):
     """
-    Read the stored watermark from the Iceberg table's properties.
-    Returns None if the property has never been set (first run).
-
-    IMPORTANT: SHOW TBLPROPERTIES table ('key') always returns exactly
-    one row shaped (key, value). When the property does NOT exist, the
-    'value' column (row[0][1]) contains the literal text:
-        "Table <name> does not have property: <key>"
-    while the 'key' column (row[0][0]) still just echoes back the key
-    name we asked for. The error text must be checked in the VALUE
-    column, not the key column - checking the wrong column silently
-    breaks all downstream filtering (this was our earlier bug).
+    Reads the stored watermark from the Iceberg table properties.
+    Returns None if the property is missing or the table has never been processed.
     """
     try:
         props_df = spark.sql(f"SHOW TBLPROPERTIES {silver_table} ('{WATERMARK_KEY}')")
         row = props_df.collect()
-        logger.debug("[%s] raw SHOW TBLPROPERTIES result: %s", silver_table, row)
-
+        
         if not row:
-            logger.info("[%s] SHOW TBLPROPERTIES returned no rows - treating as first run.", silver_table)
             return None
-
-        value = row[0][1] if len(row[0]) > 1 else row[0][0]
-
-        if value is None or "does not have property" in value or "not set" in value:
-            logger.info("[%s] no watermark set yet - this is the first run.", silver_table)
+            
+        value = str(row[0][1]) if len(row[0]) > 1 else str(row[0][0])
+        
+        # Bypass the string error returned by Spark 3 when the property is missing
+        if "does not have property" in value or "not set" in value:
             return None
-
-        logger.info("[%s] found existing watermark: %s", silver_table, value)
+            
         return value
-
     except Exception:
-        logger.warning(
-            "[%s] could not read watermark property (exception thrown), treating as first run.",
-            silver_table, exc_info=True,
-        )
         return None
 
-
 def set_watermark(silver_table, value):
+    """Updates the watermark property in the Iceberg table."""
     spark.sql(f"ALTER TABLE {silver_table} SET TBLPROPERTIES ('{WATERMARK_KEY}'='{value}')")
-    logger.debug("[%s] watermark property updated to %s", silver_table, value)
-
 
 def merge_one_table(cfg):
+    """
+    Handles the end-to-end incremental merge process for a single table.
+    """
     bronze_table = cfg["bronze_table"]
     silver_table = cfg["silver_table"]
     pk = cfg["pk"]
     columns = cfg["columns"]
 
-    logger.info("=" * 60)
     logger.info("Processing %s -> %s", bronze_table, silver_table)
-
     start_time = time.time()
 
     watermark = get_watermark(silver_table)
-    logger.info("[%s] using watermark = %s", bronze_table, watermark)
-
     bronze_df = spark.table(bronze_table)
 
+    # Filter for new records based on the watermark
     if watermark is not None:
         bronze_df = bronze_df.filter(col("arrival_time") > watermark)
 
-    if bronze_df.rdd.isEmpty():
-        logger.info("[%s] no new rows since watermark - skipping merge.", bronze_table)
+    # Fast empty check: limit(1).count() avoids the severe performance penalty of rdd.isEmpty()
+    if bronze_df.limit(1).count() == 0:
+        logger.info("[%s] No new rows since watermark - skipping.", bronze_table)
         return
 
-    new_row_count = bronze_df.count()
-    logger.info("[%s] found %d new/changed rows since watermark.", bronze_table, new_row_count)
-
-    # Bronze can contain multiple versions of the same PK within this
-    # batch window (e.g. a deal changed stage twice). Keep only the
-    # latest row per PK, ranked by arrival_time.
+    # Deduplication: Rank and select the latest record for each Primary Key within this batch
     window = Window.partitionBy(pk).orderBy(col("arrival_time").desc())
     latest_per_pk = (
         bronze_df
@@ -168,22 +146,12 @@ def merge_one_table(cfg):
         .filter(col("_rn") == 1)
         .drop("_rn")
     )
+    
+    # Cache the DataFrame to improve performance during the MERGE and MAX(time) calculations
+    latest_per_pk.cache()
+    latest_per_pk.createOrReplaceTempView(f"bronze_latest_{pk}")
 
-    deduped_count = latest_per_pk.count()
-    if deduped_count < new_row_count:
-        logger.info(
-            "[%s] deduplicated %d rows down to %d (multiple changes to same PK in this batch).",
-            bronze_table, new_row_count, deduped_count,
-        )
-
-    latest_per_pk.createOrReplaceTempView("bronze_latest")
-
-    # Log a quick breakdown of operations in this batch - useful to spot
-    # e.g. an unexpected wave of deletes.
-    op_counts = latest_per_pk.groupBy("dms_operation").count().collect()
-    op_summary = ", ".join(f"{r['dms_operation']}={r['count']}" for r in op_counts)
-    logger.info("[%s] operation breakdown: %s", bronze_table, op_summary)
-
+    # Build dynamic MERGE components
     select_cols = ", ".join(columns)
     set_clause = ", ".join([f"t.{c} = s.{c}" for c in columns if c != pk])
     insert_cols = ", ".join(columns)
@@ -191,7 +159,7 @@ def merge_one_table(cfg):
 
     merge_sql = f"""
         MERGE INTO {silver_table} t
-        USING (SELECT {select_cols}, dms_operation, arrival_time FROM bronze_latest) s
+        USING (SELECT {select_cols}, dms_operation, arrival_time FROM bronze_latest_{pk}) s
         ON t.{pk} = s.{pk}
         WHEN MATCHED AND s.dms_operation = 'delete' THEN DELETE
         WHEN MATCHED THEN UPDATE SET {set_clause}
@@ -200,56 +168,59 @@ def merge_one_table(cfg):
     """
 
     try:
-        logger.info("[%s] executing MERGE INTO %s ...", bronze_table, silver_table)
         spark.sql(merge_sql)
-    except Exception:
-        logger.error(
-            "[%s] MERGE INTO %s failed - watermark will NOT be advanced, "
-            "so these rows will be retried on the next run.",
-            bronze_table, silver_table, exc_info=True,
-        )
+    except Exception as e:
+        logger.error("[%s] MERGE INTO failed: %s", bronze_table, str(e))
         raise
 
+    # Advance the watermark to the max arrival_time processed in this batch
     max_arrival = latest_per_pk.agg({"arrival_time": "max"}).collect()[0][0]
     set_watermark(silver_table, str(max_arrival))
 
+    latest_per_pk.unpersist()
     elapsed = time.time() - start_time
-    logger.info(
-        "[%s] merge complete in %.1fs. new watermark = %s",
-        bronze_table, elapsed, max_arrival,
-    )
+    logger.info("[%s] Merge complete in %.1fs. New watermark = %s", bronze_table, elapsed, max_arrival)
 
-
-failures = []
+# ---------------------------------------------------------------------
+# Execution Logic (Parallel Processing)
+# ---------------------------------------------------------------------
 job_start = time.time()
+failures = []
 
+# Filter configurations based on Lambda arguments
+active_configs = []
 for cfg in MERGE_CONFIG:
-    try:
-        merge_one_table(cfg)
-    except Exception:
-        # Log and continue to the next table rather than aborting the
-        # whole job over one table's failure - but track it so the job
-        # ends with a non-zero-visible failure summary.
-        logger.error("[%s] table merge failed, continuing with remaining tables.", cfg["bronze_table"])
-        failures.append(cfg["bronze_table"])
+    table_short_name = cfg["bronze_table"].split('.')[-1]
+    
+    # If the list is empty (manual run), process all tables. 
+    # Otherwise, process only the target tables passed by Lambda.
+    if not tables_to_process or table_short_name in tables_to_process:
+        active_configs.append(cfg)
+
+logger.info("Executing merges in parallel for %d tables...", len(active_configs))
+
+# Execute the merge operations in parallel using ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=len(active_configs) if active_configs else 1) as executor:
+    future_to_table = {executor.submit(merge_one_table, cfg): cfg["bronze_table"] for cfg in active_configs}
+    
+    for future in as_completed(future_to_table):
+        table_name = future_to_table[future]
+        try:
+            future.result()
+        except Exception as exc:
+            logger.error("[%s] Table merge failed and threw an exception.", table_name)
+            failures.append(table_name)
 
 total_elapsed = time.time() - job_start
 logger.info("=" * 60)
 
 if failures:
-    logger.error(
-        "Job finished with %d failed table(s) out of %d in %.1fs: %s",
-        len(failures), len(MERGE_CONFIG), total_elapsed, ", ".join(failures),
-    )
+    logger.error("Job finished with %d failed table(s) in %.1fs: %s", len(failures), total_elapsed, ", ".join(failures))
 else:
-    logger.info(
-        "Job finished successfully. All %d tables merged in %.1fs.",
-        len(MERGE_CONFIG), total_elapsed,
-    )
+    logger.info("Job finished successfully. All active tables merged in %.1fs.", total_elapsed)
 
 job.commit()
 
 if failures:
-    # Non-zero exit so Glue marks the run as FAILED and any alarms/retries fire,
-    # even though job.commit() above still ran to preserve bookmark state.
+    # Exit with a non-zero status so Glue properly registers the run as FAILED
     sys.exit(1)
